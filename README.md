@@ -1,6 +1,6 @@
 # openclaw-assistant
 
-Utilities and helper scripts for the OpenClaw assistant (예원) used by 진호 주인님.
+Utilities and helper scripts for the OpenClaw assistant (예원) used by Master
 
 Included:
 - scripts/assistant_health_check.py — health check and diagnostics
