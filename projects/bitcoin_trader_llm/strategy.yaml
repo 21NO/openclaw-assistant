@@ -1,0 +1,28 @@
+# Strategy configuration for bitcoin_trader_llm
+# You can edit these params; strategy_manager will persist active versions to DB when switched.
+
+strategies:
+  - name: momentum_breakout_30m
+    timeframe: 30m
+    params:
+      breakout_lookback: 24
+      ema_short: 9
+      ema_long: 50
+      rsi_min: 50
+      vol_mult: 1.2
+      atr_k: 1.5
+      rr: 2.5
+
+  - name: mean_reversion_15m_small
+    timeframe: 15m
+    params:
+      rsi_low: 25
+      rsi_high: 75
+      size_pct: 0.5
+
+# Global defaults
+defaults:
+  risk_per_trade_pct: 3.0
+  max_daily_loss_pct: 10.0
+  max_single_order_pct: 20.0
+  min_order_krw: 5000

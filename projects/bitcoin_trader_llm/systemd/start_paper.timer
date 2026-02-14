@@ -1,0 +1,10 @@
+[Unit]
+Description=Timer to start 2-week paper trading
+
+[Timer]
+OnCalendar=*-*-* *:00:00
+# OnCalendar can be customized by the operator. This is a placeholder.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

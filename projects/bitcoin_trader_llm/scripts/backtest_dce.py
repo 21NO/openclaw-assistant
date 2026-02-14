@@ -39,6 +39,7 @@ from app.indicators import compute_features_from_ohlcv
 from app.agent_decider import decide_from_payload
 from app.policy import size_from_risk
 from app.risk_engine import RiskEngine
+from app.portfolio_manager import PortfolioManager, Signal
 
 LOG_DIR = PROJECT_ROOT / 'logs'
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -86,8 +87,9 @@ def fetch_ohlcv_range(symbol: str, interval: str, start_dt: datetime, end_dt: da
     return big
 
 
-def run_backtest(months: int = 5, slippage_pct: float = 0.001, fee_pct: float = 0.0005, time_based_exit_min: int = 60, lookback_bars: int = None, vol_mult: float = 1.5, stop_rel_default: float = 1.5, risk_pct: float | None = None, mode: str = 'dce', vol_entry_mult: float = 1.5, tp_pct: float | None = None, sl_pct: float | None = None, disable_rsi_veto: bool = False, atr_trail: bool = False, gatekeeper_only: bool = False, early_abort: bool = False, early_abort_pct: float = 0.005, early_abort_bars: int = 2, adx_threshold: float = 25.0, htf_require: str = 'any', upper_wick_pct: float | None = None, enable_risk_engine: bool = False, risk_daily_loss_pct: float = 1.0, risk_max_dd_pct: float = 10.0, risk_consec_losses: int = 3, risk_consec_mult: float = 0.5, risk_initial_pct: float | None = None, risk_min_pct: float = 0.05, risk_max_reduction_steps: int = 5, risk_recovery_step_pct: float = 0.1, risk_recovery_consec_wins: int = 3):
-    end_dt = datetime.utcnow()
+def run_backtest(months: int = 5, slippage_pct: float = 0.001, fee_pct: float = 0.0005, time_based_exit_min: int = 60, lookback_bars: int = None, vol_mult: float = 1.5, stop_rel_default: float = 1.5, risk_pct: float | None = None, mode: str = 'dce', vol_entry_mult: float = 1.5, tp_pct: float | None = None, sl_pct: float | None = None, disable_rsi_veto: bool = False, atr_trail: bool = False, gatekeeper_only: bool = False, early_abort: bool = False, early_abort_pct: float = 0.005, early_abort_bars: int = 2, adx_threshold: float = 25.0, htf_require: str = 'any', upper_wick_pct: float | None = None, enable_risk_engine: bool = False, risk_daily_loss_pct: float = 1.0, risk_max_dd_pct: float = 10.0, risk_consec_losses: int = 3, risk_consec_mult: float = 0.5, risk_initial_pct: float | None = None, risk_min_pct: float = 0.05, risk_max_reduction_steps: int = 5, risk_recovery_step_pct: float = 0.1, risk_recovery_consec_wins: int = 3, use_portfolio_manager: bool = False, pm_agent_weight: float = 0.6, pm_rule_weight: float = 0.2, agent_proposed_risk_mult: float = 2.0, risk_cooldown_days: int = 0, end_dt: datetime | None = None):
+    if end_dt is None:
+        end_dt = datetime.utcnow()
     start_dt = end_dt - timedelta(days=30 * months)
     symbol = getattr(config, 'SYMBOL', 'KRW-BTC')
     interval = getattr(config, 'CANDLE_INTERVAL', 'minutes30')
@@ -128,8 +130,18 @@ def run_backtest(months: int = 5, slippage_pct: float = 0.001, fee_pct: float = 
             max_reduction_steps=int(risk_max_reduction_steps),
             recovery_enabled=True,
             recovery_consec_wins=int(risk_recovery_consec_wins),
-            recovery_step_pct_of_initial=float(risk_recovery_step_pct)
+            recovery_step_pct_of_initial=float(risk_recovery_step_pct),
+            cooldown_days=int(risk_cooldown_days)
         )
+        # optional PortfolioManager integration
+        pm = None
+        if use_portfolio_manager:
+            try:
+                pm = PortfolioManager(risk_engine=risk_engine, agent_weight=pm_agent_weight, rule_weight=pm_rule_weight, dry_run=getattr(config, 'DRY_RUN', True))
+            except Exception:
+                pm = None
+    else:
+        pm = None
     current_day = None
 
     # determine minutes per bar from interval string
@@ -636,6 +648,112 @@ def run_backtest(months: int = 5, slippage_pct: float = 0.001, fee_pct: float = 
                     stop_price_est = entry_price_est * (1.0 - 0.03)  # fallback 3% stop
 
             equity_for_risk = cash + (position['amount'] * mark_price if position else 0.0)
+
+            # If PortfolioManager integration requested, use it for sizing & risk evaluation
+            if use_portfolio_manager and 'pm' in locals() and pm is not None:
+                # block new entries if daily loss limit reached
+                try:
+                    if enable_risk_engine and risk_engine is not None and not risk_engine.allow_entry():
+                        continue
+                except Exception:
+                    pass
+
+                # derive suggested risk for agent signal (agent may be more aggressive)
+                try:
+                    base_initial = float(risk_engine.initial_risk_pct) if (risk_engine is not None) else float(getattr(config, 'RISK_PER_TRADE_PCT', 1.0))
+                except Exception:
+                    base_initial = float(getattr(config, 'RISK_PER_TRADE_PCT', 1.0))
+                # interpret agent_proposed_risk_mult (e.g., 2.0 -> double)
+                try:
+                    agent_prop_risk = float(base_initial) * float(agent_proposed_risk_mult)
+                except Exception:
+                    agent_prop_risk = float(base_initial) * 2.0
+
+                # compute stop pct (percent)
+                try:
+                    stop_pct = ((entry_price_est - float(stop_price_est)) / float(entry_price_est)) * 100.0
+                except Exception:
+                    stop_pct = float(1.0)
+
+                # build agent signal
+                agent_signal = Signal(
+                    id=f'sig-agent-{idx}',
+                    source='agent',
+                    publish_ts=datetime.utcnow().isoformat(),
+                    symbol=symbol,
+                    side='long',
+                    score=float(decision.get('confidence') or 0.5),
+                    p_win=float(decision.get('confidence') or 0.5),
+                    confidence=float(decision.get('confidence') or 0.5),
+                    suggested_risk_pct=float(agent_prop_risk),
+                    suggested_stop_pct=float(stop_pct),
+                    horizon_minutes=int(decision.get('meta', {}).get('horizon_minutes') or 720),
+                    model_version=decision.get('meta', {}).get('decider') or 'agent_dce',
+                    meta={'entry_price': entry_price_est}
+                )
+
+                # simple rule signal (auxiliary) - use a modest score and conservative risk
+                rule_signal = Signal(
+                    id=f'sig-rule-{idx}',
+                    source='rule',
+                    publish_ts=datetime.utcnow().isoformat(),
+                    symbol=symbol,
+                    side='long',
+                    score=max(0.1, float(decision.get('confidence') or 0.2) * 0.5),
+                    p_win=None,
+                    confidence=None,
+                    suggested_risk_pct=float(base_initial),
+                    suggested_stop_pct=float(stop_pct),
+                    horizon_minutes=720,
+                    model_version='rule-simple',
+                    meta={}
+                )
+
+                pm.ingest_signals([agent_signal, rule_signal])
+                proposals = pm.propose_positions(equity=equity_for_risk, market_state={'price': entry_price_est})
+                if not proposals:
+                    continue
+                decisions_pm = pm.apply_risk_engine(proposals, portfolio_snapshot={'equity': equity_for_risk}, market_state={'price': entry_price_est})
+                orders = pm.finalize_orders(decisions_pm, market_state={'price': entry_price_est}, equity=equity_for_risk)
+                if not orders:
+                    continue
+
+                # execute first order (single-position system)
+                ord0 = orders[0]
+                exec_price = next_bar['open'] * (1.0 + slippage_pct)
+                units = float(ord0.units)
+                entry_fee = exec_price * units * fee_pct
+                cash -= exec_price * units + entry_fee
+
+                # compute actual stop and tp based on executed price
+                if sl_pct is not None:
+                    actual_sl = exec_price * (1.0 - float(sl_pct))
+                else:
+                    actual_sl = exec_price - (atr * float(stop_rel)) if atr and atr > 0 else exec_price * (1.0 - 0.03)
+                tp_price = exec_price * (1.0 + float(tp_pct)) if tp_pct is not None else None
+
+                position = {
+                    'entry_price': exec_price,
+                    'amount': units,
+                    'sl_price': actual_sl,
+                    'tp_price': tp_price,
+                    'entry_idx': idx + 1,
+                    'entry_time': next_bar['timestamp']
+                }
+                trades.append({
+                    'entry_time': position['entry_time'].isoformat(),
+                    'exit_time': None,
+                    'entry_price': position['entry_price'],
+                    'exit_price': None,
+                    'amount': position['amount'],
+                    'pnl': None,
+                    'reason': 'entry_pm',
+                    'gate_info': current_gate_info.copy() if current_gate_info is not None else None
+                })
+                continue
+
+            # fallback: original sizing logic
+            equity_for_risk = cash + (position['amount'] * mark_price if position else 0.0)
             # risk engine enforcement (optional)
             eff_risk_pct = risk_pct
             if enable_risk_engine and risk_engine is not None:
@@ -816,6 +934,11 @@ if __name__ == '__main__':
     p.add_argument('--risk-max-reductions', type=int, default=5, help='Maximum number of multiplicative reduction steps allowed')
     p.add_argument('--risk-recovery-step-pct', type=float, default=0.1, help='Recovery step as fraction of initial risk (e.g. 0.1 = 10% of initial)')
     p.add_argument('--risk-recovery-consec-wins', type=int, default=3, help='Consecutive winning trades required to trigger a recovery step')
+    p.add_argument('--use-portfolio-manager', action='store_true', help='Use PortfolioManager for sizing and decision aggregation (agent+rule merging)')
+    p.add_argument('--pm-agent-weight', type=float, default=0.6, help='Agent weight in PortfolioManager')
+    p.add_argument('--pm-rule-weight', type=float, default=0.2, help='Rule weight in PortfolioManager')
+    p.add_argument('--agent-proposed-risk-mult', type=float, default=2.0, help='Agent proposed risk as multiplier of initial_risk_pct (e.g., 2.0 -> agent proposes 2x initial)')
+    p.add_argument('--risk-cooldown-days', type=int, default=0, help='Cooldown days between risk reductions')
     args = p.parse_args()
     time_exit_value = 0 if args.disable_time_exit else args.time_exit_min
-    run_backtest(months=args.months, slippage_pct=args.slippage, fee_pct=args.fee, time_based_exit_min=time_exit_value, vol_mult=args.vol_mult, stop_rel_default=args.stop_rel, risk_pct=args.risk_pct, mode=args.mode, vol_entry_mult=args.vol_entry_mult, tp_pct=args.tp_pct, sl_pct=args.sl_pct, disable_rsi_veto=args.disable_rsi_veto, atr_trail=args.atr_trail, gatekeeper_only=args.gatekeeper_only, early_abort=args.early_abort, early_abort_pct=args.early_abort_pct, early_abort_bars=args.early_abort_bars, adx_threshold=args.adx_threshold, htf_require=args.htf_require, upper_wick_pct=args.upper_wick_pct, enable_risk_engine=args.enable_risk_engine, risk_daily_loss_pct=args.risk_daily_loss_pct, risk_max_dd_pct=args.risk_max_dd_pct, risk_consec_losses=args.risk_consec_losses, risk_consec_mult=args.risk_consec_mult, risk_initial_pct=args.risk_initial_pct, risk_min_pct=args.risk_min_pct, risk_max_reduction_steps=args.risk_max_reductions, risk_recovery_step_pct=args.risk_recovery_step_pct, risk_recovery_consec_wins=args.risk_recovery_consec_wins)
+    run_backtest(months=args.months, slippage_pct=args.slippage, fee_pct=args.fee, time_based_exit_min=time_exit_value, vol_mult=args.vol_mult, stop_rel_default=args.stop_rel, risk_pct=args.risk_pct, mode=args.mode, vol_entry_mult=args.vol_entry_mult, tp_pct=args.tp_pct, sl_pct=args.sl_pct, disable_rsi_veto=args.disable_rsi_veto, atr_trail=args.atr_trail, gatekeeper_only=args.gatekeeper_only, early_abort=args.early_abort, early_abort_pct=args.early_abort_pct, early_abort_bars=args.early_abort_bars, adx_threshold=args.adx_threshold, htf_require=args.htf_require, upper_wick_pct=args.upper_wick_pct, enable_risk_engine=args.enable_risk_engine, risk_daily_loss_pct=args.risk_daily_loss_pct, risk_max_dd_pct=args.risk_max_dd_pct, risk_consec_losses=args.risk_consec_losses, risk_consec_mult=args.risk_consec_mult, risk_initial_pct=args.risk_initial_pct, risk_min_pct=args.risk_min_pct, risk_max_reduction_steps=args.risk_max_reductions, risk_recovery_step_pct=args.risk_recovery_step_pct, risk_recovery_consec_wins=args.risk_recovery_consec_wins, use_portfolio_manager=args.use_portfolio_manager, pm_agent_weight=args.pm_agent_weight, pm_rule_weight=args.pm_rule_weight, agent_proposed_risk_mult=args.agent_proposed_risk_mult, risk_cooldown_days=args.risk_cooldown_days)
