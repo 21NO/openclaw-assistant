@@ -14,6 +14,7 @@ live (DRY_RUN) simulations.
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional, Dict
+from datetime import datetime, timedelta
 
 
 @dataclass
@@ -31,6 +32,8 @@ class RiskEngine:
     recovery_enabled: bool = True
     recovery_consec_wins: int = 3  # number of consecutive winning trades to trigger a partial recovery
     recovery_step_pct_of_initial: float = 0.1  # recover by this fraction of initial_risk_pct (absolute)
+    # cooldown (days) between successive reductions
+    cooldown_days: int = 0
 
     # runtime state
     start_of_day_nav: Optional[float] = None
@@ -47,6 +50,7 @@ class RiskEngine:
     consecutive_loss_triggers: int = 0
     reduction_steps: int = 0
     events: list = field(default_factory=list)
+    last_reduction_ts: Optional[datetime] = None
 
     def __post_init__(self):
         # ensure sensible bounds
@@ -88,10 +92,35 @@ class RiskEngine:
         return float(min(br, self.current_risk_pct))
 
     def _apply_reduction(self, reason: str, timestamp=None):
-        """Apply a multiplicative reduction to current_risk_pct honoring min and max steps."""
+        """Apply a multiplicative reduction to current_risk_pct honoring min and max steps and cooldown."""
+        # enforce cooldown between reductions if configured
+        try:
+            ts = None
+            if timestamp is not None:
+                if isinstance(timestamp, str):
+                    try:
+                        ts = datetime.fromisoformat(timestamp)
+                    except Exception:
+                        ts = datetime.utcnow()
+                elif isinstance(timestamp, datetime):
+                    ts = timestamp
+                else:
+                    ts = datetime.utcnow()
+            else:
+                ts = datetime.utcnow()
+        except Exception:
+            ts = datetime.utcnow()
+
+        if self.last_reduction_ts is not None and int(self.cooldown_days) > 0:
+            delta = ts - self.last_reduction_ts
+            if delta < timedelta(days=int(self.cooldown_days)):
+                # cooldown not elapsed
+                self.events.append({'type': 'reduction_limited', 'reason': f'cooldown ({self.cooldown_days}d)', 'reduction_steps': self.reduction_steps, 'timestamp': ts.isoformat()})
+                return
+
         if self.reduction_steps >= int(self.max_reduction_steps):
             # already at max reductions; do not reduce further
-            self.events.append({'type': 'reduction_limited', 'reason': reason, 'reduction_steps': self.reduction_steps, 'timestamp': timestamp})
+            self.events.append({'type': 'reduction_limited', 'reason': reason, 'reduction_steps': self.reduction_steps, 'timestamp': ts.isoformat()})
             return
         old = float(self.current_risk_pct)
         new = float(self.current_risk_pct) * float(self.consecutive_loss_multiplier)
@@ -103,7 +132,8 @@ class RiskEngine:
             self.current_risk_pct = new
             self.reduction_steps += 1
             self.consecutive_loss_triggers += 1
-            self.events.append({'type': 'risk_reduction', 'reason': reason, 'old_risk_pct': old, 'new_risk_pct': new, 'timestamp': timestamp, 'reduction_steps': self.reduction_steps})
+            self.last_reduction_ts = ts
+            self.events.append({'type': 'risk_reduction', 'reason': reason, 'old_risk_pct': old, 'new_risk_pct': new, 'timestamp': ts.isoformat(), 'reduction_steps': self.reduction_steps})
 
     def _attempt_recovery(self, timestamp=None):
         """Attempt to recover risk_pct toward initial_risk_pct in small steps when conditions met."""
