@@ -1,0 +1,44 @@
+{
+  "file": "backtest_20260213_214746.json",
+  "json_path": "/root/.openclaw/workspace/projects/bitcoin_trader_llm/logs/backtest_20260213_214746.json",
+  "vol": 1.5,
+  "adx": 30.0,
+  "htf": "both",
+  "upper_wick": "0.5",
+  "overall_pf": 2.9023029148618846,
+  "total_pnl": 1309362.0911936164,
+  "max_drawdown": 0.003943658589070816,
+  "num_trades": 14,
+  "block_count_wick": 32,
+  "folds": [
+    {
+      "fold": 0,
+      "test_trades": 1,
+      "pf": null,
+      "total_pnl": 270516.65552483697,
+      "maxdd": 0.0
+    },
+    {
+      "fold": 1,
+      "test_trades": 2,
+      "pf": 1.4169284705183252,
+      "total_pnl": 79805.61160919786,
+      "maxdd": 191413.19735249452
+    },
+    {
+      "fold": 2,
+      "test_trades": 3,
+      "pf": null,
+      "total_pnl": 664635.8773517348,
+      "maxdd": 0.0
+    },
+    {
+      "fold": 3,
+      "test_trades": 0,
+      "pf": null,
+      "total_pnl": 0.0,
+      "maxdd": 0.0
+    }
+  ],
+  "ok_folds": false
+}

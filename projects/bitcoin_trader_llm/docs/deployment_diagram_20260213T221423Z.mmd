@@ -1,0 +1,12 @@
+flowchart LR
+  MarketData["Market Data
+(ohlcv/orderbook)"] --> Compute["Feature Compute
+(indicators)"]
+  Compute --> Decider["Agent Decider
+(D+C+E)"]
+  Decider --> Signals["Signals (DB)"]
+  Signals --> Executor["Executor (paper/live)
+(DRY_RUN gate)"]
+  Executor --> Reflections["Reflections & Metrics
+(DB)"]
+  Reflections --> Analysis["Backtest/Retest/Break-even Analysis"]
