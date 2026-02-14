@@ -1,0 +1,9 @@
+[Unit]
+Description=Start 2-week paper trading (placeholder)
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/root/.openclaw/workspace/projects/bitcoin_trader_llm/scripts/start_paper.sh
+WorkingDirectory=/root/.openclaw/workspace/projects/bitcoin_trader_llm
+User=$USER
