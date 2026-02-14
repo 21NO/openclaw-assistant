@@ -5,6 +5,7 @@ Provides a lightweight RiskEngine that:
 - Tracks peak NAV and drawdown
 - Tracks consecutive losing trades
 - Applies reductions to per-trade risk_pct when triggers activate
+- Limits depth of reductions and supports a conservative recovery/ramp-up
 - Provides allow_entry() and get_effective_risk_pct() interfaces used by backtester
 
 This is intentionally simple and stateful so it can be used in backtests and
@@ -17,11 +18,19 @@ from typing import Optional, Dict
 
 @dataclass
 class RiskEngine:
+    # configuration
     initial_risk_pct: float = 1.0  # percent
+    min_risk_pct: float = 0.05  # do not reduce below this fraction (absolute, e.g. 0.05 -> 5% of initial equity)
     daily_loss_limit_pct: float = 1.0  # percent (if realized loss >= this percent of start_of_day_nav -> block entries)
     max_drawdown_limit_pct: float = 10.0  # percent (if drawdown >= this percent -> reduce risk)
     consecutive_losses_threshold: int = 3
     consecutive_loss_multiplier: float = 0.5  # multiply risk_pct when threshold exceeded
+    max_reduction_steps: int = 5  # maximum number of multiplicative reductions allowed
+
+    # recovery configuration
+    recovery_enabled: bool = True
+    recovery_consec_wins: int = 3  # number of consecutive winning trades to trigger a partial recovery
+    recovery_step_pct_of_initial: float = 0.1  # recover by this fraction of initial_risk_pct (absolute)
 
     # runtime state
     start_of_day_nav: Optional[float] = None
@@ -29,15 +38,25 @@ class RiskEngine:
     peak_nav: Optional[float] = None
     current_risk_pct: float = field(init=False)
     consecutive_losses: int = 0
+    consecutive_wins: int = 0
     blocked_for_day: bool = False
 
     # counters for reporting
     daily_loss_triggers: int = 0
     dd_triggers: int = 0
     consecutive_loss_triggers: int = 0
+    reduction_steps: int = 0
     events: list = field(default_factory=list)
 
     def __post_init__(self):
+        # ensure sensible bounds
+        self.initial_risk_pct = float(self.initial_risk_pct)
+        self.min_risk_pct = float(self.min_risk_pct)
+        if self.min_risk_pct < 0.0:
+            self.min_risk_pct = 0.01
+        # cap min to initial
+        if self.min_risk_pct > self.initial_risk_pct:
+            self.min_risk_pct = float(self.initial_risk_pct)
         self.current_risk_pct = float(self.initial_risk_pct)
 
     def on_new_day(self, nav: float):
@@ -68,6 +87,40 @@ class RiskEngine:
         # risk engine enforces an upper cap
         return float(min(br, self.current_risk_pct))
 
+    def _apply_reduction(self, reason: str, timestamp=None):
+        """Apply a multiplicative reduction to current_risk_pct honoring min and max steps."""
+        if self.reduction_steps >= int(self.max_reduction_steps):
+            # already at max reductions; do not reduce further
+            self.events.append({'type': 'reduction_limited', 'reason': reason, 'reduction_steps': self.reduction_steps, 'timestamp': timestamp})
+            return
+        old = float(self.current_risk_pct)
+        new = float(self.current_risk_pct) * float(self.consecutive_loss_multiplier)
+        # enforce floor
+        if new < float(self.min_risk_pct):
+            new = float(self.min_risk_pct)
+        # only record if change
+        if new != old:
+            self.current_risk_pct = new
+            self.reduction_steps += 1
+            self.consecutive_loss_triggers += 1
+            self.events.append({'type': 'risk_reduction', 'reason': reason, 'old_risk_pct': old, 'new_risk_pct': new, 'timestamp': timestamp, 'reduction_steps': self.reduction_steps})
+
+    def _attempt_recovery(self, timestamp=None):
+        """Attempt to recover risk_pct toward initial_risk_pct in small steps when conditions met."""
+        if not self.recovery_enabled:
+            return
+        if self.current_risk_pct >= self.initial_risk_pct:
+            return
+        # increase by a fraction of initial risk (absolute)
+        step = float(self.initial_risk_pct) * float(self.recovery_step_pct_of_initial)
+        candidate = float(self.current_risk_pct) + step
+        if candidate > self.initial_risk_pct:
+            candidate = float(self.initial_risk_pct)
+        old = float(self.current_risk_pct)
+        if candidate > old:
+            self.current_risk_pct = candidate
+            self.events.append({'type': 'risk_recovery', 'old_risk_pct': old, 'new_risk_pct': self.current_risk_pct, 'timestamp': timestamp})
+
     def record_trade_result(self, pnl: float, nav_after: float, timestamp=None):
         """Record realized trade result immediately after trade exit.
 
@@ -79,10 +132,12 @@ class RiskEngine:
         # update daily realized PnL
         self.daily_realized_pnl += float(pnl)
 
-        # update consecutive losses
+        # update consecutive trackers
         if pnl <= 0:
             self.consecutive_losses += 1
+            self.consecutive_wins = 0
         else:
+            self.consecutive_wins += 1
             self.consecutive_losses = 0
 
         # update peak/nav drawdown tracking
@@ -106,28 +161,29 @@ class RiskEngine:
 
         # check consecutive losses trigger
         if self.consecutive_losses >= int(self.consecutive_losses_threshold):
-            # reduce risk
-            old = self.current_risk_pct
-            self.current_risk_pct = max(0.01, float(self.current_risk_pct) * float(self.consecutive_loss_multiplier))
-            self.consecutive_loss_triggers += 1
-            self.events.append({'type': 'consecutive_losses', 'count': self.consecutive_losses, 'old_risk_pct': old, 'new_risk_pct': self.current_risk_pct, 'timestamp': timestamp})
+            self._apply_reduction('consecutive_losses', timestamp=timestamp)
             # reset consecutive losses counter after applying reduction to avoid repeated immediate triggers
             self.consecutive_losses = 0
 
         # check drawdown trigger
         if drawdown >= float(self.max_drawdown_limit_pct):
-            old = self.current_risk_pct
-            self.current_risk_pct = max(0.01, float(self.current_risk_pct) * float(self.consecutive_loss_multiplier))
-            self.dd_triggers += 1
-            self.events.append({'type': 'max_drawdown', 'drawdown_pct': drawdown, 'old_risk_pct': old, 'new_risk_pct': self.current_risk_pct, 'timestamp': timestamp})
+            self._apply_reduction('max_drawdown', timestamp=timestamp)
+
+        # attempt recovery on consecutive wins
+        if self.consecutive_wins >= int(self.recovery_consec_wins):
+            self._attempt_recovery(timestamp=timestamp)
+            # reset wins counter after recovery step
+            self.consecutive_wins = 0
 
     def summary(self) -> Dict:
         return {
             'initial_risk_pct': self.initial_risk_pct,
+            'min_risk_pct': self.min_risk_pct,
             'current_risk_pct': self.current_risk_pct,
             'daily_loss_triggers': self.daily_loss_triggers,
             'consecutive_loss_triggers': self.consecutive_loss_triggers,
             'dd_triggers': self.dd_triggers,
+            'reduction_steps': self.reduction_steps,
             'blocked_for_day': self.blocked_for_day,
             'events': list(self.events)
         }

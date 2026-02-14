@@ -86,7 +86,7 @@ def fetch_ohlcv_range(symbol: str, interval: str, start_dt: datetime, end_dt: da
     return big
 
 
-def run_backtest(months: int = 5, slippage_pct: float = 0.001, fee_pct: float = 0.0005, time_based_exit_min: int = 60, lookback_bars: int = None, vol_mult: float = 1.5, stop_rel_default: float = 1.5, risk_pct: float | None = None, mode: str = 'dce', vol_entry_mult: float = 1.5, tp_pct: float | None = None, sl_pct: float | None = None, disable_rsi_veto: bool = False, atr_trail: bool = False, gatekeeper_only: bool = False, early_abort: bool = False, early_abort_pct: float = 0.005, early_abort_bars: int = 2, adx_threshold: float = 25.0, htf_require: str = 'any', upper_wick_pct: float | None = None, enable_risk_engine: bool = False, risk_daily_loss_pct: float = 1.0, risk_max_dd_pct: float = 10.0, risk_consec_losses: int = 3, risk_consec_mult: float = 0.5, risk_initial_pct: float | None = None):
+def run_backtest(months: int = 5, slippage_pct: float = 0.001, fee_pct: float = 0.0005, time_based_exit_min: int = 60, lookback_bars: int = None, vol_mult: float = 1.5, stop_rel_default: float = 1.5, risk_pct: float | None = None, mode: str = 'dce', vol_entry_mult: float = 1.5, tp_pct: float | None = None, sl_pct: float | None = None, disable_rsi_veto: bool = False, atr_trail: bool = False, gatekeeper_only: bool = False, early_abort: bool = False, early_abort_pct: float = 0.005, early_abort_bars: int = 2, adx_threshold: float = 25.0, htf_require: str = 'any', upper_wick_pct: float | None = None, enable_risk_engine: bool = False, risk_daily_loss_pct: float = 1.0, risk_max_dd_pct: float = 10.0, risk_consec_losses: int = 3, risk_consec_mult: float = 0.5, risk_initial_pct: float | None = None, risk_min_pct: float = 0.05, risk_max_reduction_steps: int = 5, risk_recovery_step_pct: float = 0.1, risk_recovery_consec_wins: int = 3):
     end_dt = datetime.utcnow()
     start_dt = end_dt - timedelta(days=30 * months)
     symbol = getattr(config, 'SYMBOL', 'KRW-BTC')
@@ -118,7 +118,18 @@ def run_backtest(months: int = 5, slippage_pct: float = 0.001, fee_pct: float = 
             initial = float(risk_initial_pct) if (risk_initial_pct is not None) else (float(risk_pct) if (risk_pct is not None) else float(config.RISK_PER_TRADE_PCT))
         except Exception:
             initial = float(config.RISK_PER_TRADE_PCT)
-        risk_engine = RiskEngine(initial_risk_pct=initial, daily_loss_limit_pct=float(risk_daily_loss_pct), max_drawdown_limit_pct=float(risk_max_dd_pct), consecutive_losses_threshold=int(risk_consec_losses), consecutive_loss_multiplier=float(risk_consec_mult))
+        risk_engine = RiskEngine(
+            initial_risk_pct=initial,
+            min_risk_pct=float(risk_min_pct),
+            daily_loss_limit_pct=float(risk_daily_loss_pct),
+            max_drawdown_limit_pct=float(risk_max_dd_pct),
+            consecutive_losses_threshold=int(risk_consec_losses),
+            consecutive_loss_multiplier=float(risk_consec_mult),
+            max_reduction_steps=int(risk_max_reduction_steps),
+            recovery_enabled=True,
+            recovery_consec_wins=int(risk_recovery_consec_wins),
+            recovery_step_pct_of_initial=float(risk_recovery_step_pct)
+        )
     current_day = None
 
     # determine minutes per bar from interval string
@@ -801,6 +812,10 @@ if __name__ == '__main__':
     p.add_argument('--risk-consec-losses', type=int, default=3, help='Consecutive losing trades threshold')
     p.add_argument('--risk-consec-mult', type=float, default=0.5, help='Multiplier to apply to risk_pct on consecutive loss/DD triggers (e.g., 0.5)')
     p.add_argument('--risk-initial-pct', type=float, default=None, help='Initial per-trade risk pct for risk engine (overrides RISK_PER_TRADE_PCT)')
+    p.add_argument('--risk-min-pct', type=float, default=0.05, help='Minimum allowed risk pct floor (absolute, e.g. 0.05)')
+    p.add_argument('--risk-max-reductions', type=int, default=5, help='Maximum number of multiplicative reduction steps allowed')
+    p.add_argument('--risk-recovery-step-pct', type=float, default=0.1, help='Recovery step as fraction of initial risk (e.g. 0.1 = 10% of initial)')
+    p.add_argument('--risk-recovery-consec-wins', type=int, default=3, help='Consecutive winning trades required to trigger a recovery step')
     args = p.parse_args()
     time_exit_value = 0 if args.disable_time_exit else args.time_exit_min
-    run_backtest(months=args.months, slippage_pct=args.slippage, fee_pct=args.fee, time_based_exit_min=time_exit_value, vol_mult=args.vol_mult, stop_rel_default=args.stop_rel, risk_pct=args.risk_pct, mode=args.mode, vol_entry_mult=args.vol_entry_mult, tp_pct=args.tp_pct, sl_pct=args.sl_pct, disable_rsi_veto=args.disable_rsi_veto, atr_trail=args.atr_trail, gatekeeper_only=args.gatekeeper_only, early_abort=args.early_abort, early_abort_pct=args.early_abort_pct, early_abort_bars=args.early_abort_bars, adx_threshold=args.adx_threshold, htf_require=args.htf_require, upper_wick_pct=args.upper_wick_pct, enable_risk_engine=args.enable_risk_engine, risk_daily_loss_pct=args.risk_daily_loss_pct, risk_max_dd_pct=args.risk_max_dd_pct, risk_consec_losses=args.risk_consec_losses, risk_consec_mult=args.risk_consec_mult, risk_initial_pct=args.risk_initial_pct)
+    run_backtest(months=args.months, slippage_pct=args.slippage, fee_pct=args.fee, time_based_exit_min=time_exit_value, vol_mult=args.vol_mult, stop_rel_default=args.stop_rel, risk_pct=args.risk_pct, mode=args.mode, vol_entry_mult=args.vol_entry_mult, tp_pct=args.tp_pct, sl_pct=args.sl_pct, disable_rsi_veto=args.disable_rsi_veto, atr_trail=args.atr_trail, gatekeeper_only=args.gatekeeper_only, early_abort=args.early_abort, early_abort_pct=args.early_abort_pct, early_abort_bars=args.early_abort_bars, adx_threshold=args.adx_threshold, htf_require=args.htf_require, upper_wick_pct=args.upper_wick_pct, enable_risk_engine=args.enable_risk_engine, risk_daily_loss_pct=args.risk_daily_loss_pct, risk_max_dd_pct=args.risk_max_dd_pct, risk_consec_losses=args.risk_consec_losses, risk_consec_mult=args.risk_consec_mult, risk_initial_pct=args.risk_initial_pct, risk_min_pct=args.risk_min_pct, risk_max_reduction_steps=args.risk_max_reductions, risk_recovery_step_pct=args.risk_recovery_step_pct, risk_recovery_consec_wins=args.risk_recovery_consec_wins)
