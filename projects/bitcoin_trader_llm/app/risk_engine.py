@@ -175,6 +175,69 @@ class RiskEngine:
             # reset wins counter after recovery step
             self.consecutive_wins = 0
 
+    def evaluate_proposal(self, proposal: Optional[dict], portfolio_snapshot: Optional[dict] = None, market_state: Optional[dict] = None, timestamp=None) -> Dict:
+        """Evaluate a proposed position and return a decision dict.
+
+        Decision format:
+            {
+                'allow': bool,
+                'scale': float,  # 0..1 multiplier to apply to proposed units
+                'adjusted_risk_pct': float,  # effective per-trade risk pct after scaling
+                'reason': str,
+                'events': list
+            }
+        The method enforces daily blocks and caps the proposal's suggested_risk_pct by the current_risk_pct.
+        """
+        # If entries are blocked for the day, veto immediately
+        if self.blocked_for_day:
+            evt = {'type': 'risk_vetoed', 'reason': 'daily_loss_blocked', 'timestamp': timestamp}
+            self.events.append(evt)
+            return {'allow': False, 'scale': 0.0, 'adjusted_risk_pct': 0.0, 'reason': 'daily_loss_blocked', 'events': [evt]}
+
+        # Extract base risk from proposal
+        base_risk = None
+        if proposal and isinstance(proposal, dict):
+            base_risk = proposal.get('suggested_risk_pct') or proposal.get('suggested_risk')
+        # allow objects with attributes by trying getattr
+        if base_risk is None and proposal is not None:
+            try:
+                base_risk = getattr(proposal, 'suggested_risk_pct', None) or getattr(proposal, 'suggested_risk', None)
+            except Exception:
+                base_risk = None
+
+        try:
+            base_risk = float(base_risk) if base_risk is not None else float(self.initial_risk_pct)
+        except Exception:
+            base_risk = float(self.initial_risk_pct)
+
+        # If base_risk is zero or negative, allow by default
+        if base_risk <= 0.0:
+            return {'allow': True, 'scale': 1.0, 'adjusted_risk_pct': float(self.initial_risk_pct), 'reason': 'no_base_risk', 'events': []}
+
+        # Compute scale as ratio of current cap to base risk
+        try:
+            scale = float(self.current_risk_pct) / float(base_risk) if float(base_risk) > 0 else 1.0
+        except Exception:
+            scale = 1.0
+
+        # Clamp scale
+        if scale <= 0.0:
+            evt = {'type': 'risk_vetoed', 'reason': 'scale_zero', 'timestamp': timestamp}
+            self.events.append(evt)
+            return {'allow': False, 'scale': 0.0, 'adjusted_risk_pct': 0.0, 'reason': 'scale_zero', 'events': [evt]}
+        if scale > 1.0:
+            scale = 1.0
+
+        adjusted = float(base_risk) * float(scale)
+        # Record a scaling event if scale < 1
+        if scale < 1.0:
+            evt = {'type': 'risk_scaled', 'reason': 'cap_enforced_current_risk', 'base_risk_pct': float(base_risk), 'new_risk_pct': adjusted, 'scale': scale, 'timestamp': timestamp}
+            self.events.append(evt)
+            return {'allow': True, 'scale': float(scale), 'adjusted_risk_pct': adjusted, 'reason': 'cap_enforced_current_risk', 'events': [evt]}
+
+        # otherwise allow as-is
+        return {'allow': True, 'scale': 1.0, 'adjusted_risk_pct': adjusted, 'reason': 'ok', 'events': []}
+
     def summary(self) -> Dict:
         return {
             'initial_risk_pct': self.initial_risk_pct,
